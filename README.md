@@ -346,7 +346,11 @@ mkdir -p /kaggle/working/data
 
 ---
 
-## 📄 License & Credits
+## 📄 License
 
-Built for Debian 13 + Kaggle free tier (T4 GPU, 30 GB RAM).
-Uses: Cloudflare Tunnels, TigerVNC, noVNC, websockify, code-server, ttyd.
+**Proprietary — All Rights Reserved.**
+
+Copyright (c) 2026 **Cluster / Mohammad Zaid**. All code in this repository is
+the property of Cluster / Mohammad Zaid. Viewing is permitted; copying,
+modifying, redistributing or deploying is not, without prior written permission.
+See [LICENSE](LICENSE).
