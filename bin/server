@@ -1,0 +1,755 @@
+#!/usr/bin/env bash
+# bin/server — Master control CLI for Kaggle Debian Compute Server.
+#
+# Commands:
+#   up          Generate notebook, push to Kaggle, and wait until server is live
+#   status      Show kernel state and live CPU/GPU/RAM stats from your-subdomain.example.com
+#   ssh         Open an interactive SSH shell on Kaggle
+#   gui <cmd>   Run a GUI app on Kaggle with window displayed on Debian 13 XFCE
+#   logs        View Kaggle logs
+#   follow      Live stream Kaggle execution logs
+#   web         Open Web Dashboard in browser
+#   terminal    Open browser-based Web Terminal
+#   save        Save installed software & configs to persistent cache bundle
+#   push        Upload files/folders from local PC to Kaggle
+#   pull        Download files/folders from Kaggle to local PC
+#   stop        Safely terminate the Kaggle server
+#   vscode      Print or install VS Code Remote-SSH configuration
+#
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$ROOT/.env"
+PROXY_SCRIPT="$ROOT/bin/cf-proxy.py"
+MAKE_KERNEL="$ROOT/lib/make_kernel.py"
+
+# Colors
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_CYAN="\033[36m"
+C_GREEN="\033[32m"
+C_YELLOW="\033[33m"
+C_RED="\033[31m"
+C_DIM="\033[2m"
+
+# Load .env
+if [[ -f "$ENV_FILE" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    if [[ "$line" == *=* ]]; then
+      key="${line%%=*}"
+      val="${line#*=}"
+      key="$(echo "$key" | tr -d '[:space:]')"
+      val="$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+      if [[ -n "$key" ]]; then
+        export "$key"="$val"
+      fi
+    fi
+  done < "$ENV_FILE"
+  TOKEN="$(grep -m1 -oE 'KGAT_[A-Za-z0-9]+' "$ENV_FILE" || true)"
+  [[ -n "$TOKEN" ]] && export KAGGLE_API_TOKEN="$TOKEN"
+fi
+
+POOL_HELPER="$ROOT/lib/account_pool.py"
+if [[ -f "$POOL_HELPER" ]]; then
+  eval "$(python3 "$POOL_HELPER" env 2>/dev/null | grep '^export ')"
+fi
+
+KERNEL="${KERNEL:-$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["id"])' "$ROOT/kernel-metadata.json" 2>/dev/null || echo "zkmohammad/debian-linux-server")}"
+CLUSTER_URL="${CLUSTER_URL:-https://your-subdomain.example.com}"
+AUTH_USER="${CLUSTER_AUTH_USER:-}"
+AUTH_PASS="${CLUSTER_AUTH_PASS:-}"
+
+die() { echo -e "${C_RED}error: $*${C_RESET}" >&2; exit 1; }
+
+pretty_logs() {
+  python3 -c '
+import sys, json
+for raw in sys.stdin:
+    line = raw.rstrip("\n").lstrip(",")
+    if not line.lstrip().startswith("{"):
+        sys.stdout.write(raw)
+        continue
+    try:
+        rec = json.loads(line)
+    except Exception:
+        sys.stdout.write(raw)
+        continue
+    items = rec if isinstance(rec, list) else [rec]
+    for r in items:
+        if isinstance(r, dict) and "data" in r:
+            sys.stdout.write(r.get("data", ""))
+        else:
+            sys.stdout.write(json.dumps(r) + "\n")
+'
+}
+
+CLEAN_HOST="$(echo "$CLUSTER_URL" | sed -e 's|^https\?://||' -e 's|/.*$||')"
+
+run_ssh() {
+  local ssh_flags=()
+  local remote_cmd=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --)
+        shift
+        remote_cmd+=("$@")
+        break
+        ;;
+      -*)
+        ssh_flags+=("$1")
+        shift
+        ;;
+  *)
+        remote_cmd+=("$@")
+        break
+        ;;
+    esac
+  done
+
+  local escaped_cmd=""
+  if [[ ${#remote_cmd[@]} -gt 0 ]]; then
+    # Join raw (no per-word %q escaping). Escaping turned multi-word commands such
+    # as "bash -s" or 'echo a; b' into a single invalid command name.
+    escaped_cmd="${remote_cmd[*]}"
+  fi
+
+  if [[ -n "$escaped_cmd" ]]; then
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=4 \
+        -o Compression=yes \
+        -o ProxyCommand="python3 $PROXY_SCRIPT --url $CLUSTER_URL/ws/ssh --user $AUTH_USER --password $AUTH_PASS" \
+        "${ssh_flags[@]}" \
+        "root@$CLEAN_HOST" \
+        "$escaped_cmd"
+  else
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=4 \
+        -o Compression=yes \
+        -o ProxyCommand="python3 $PROXY_SCRIPT --url $CLUSTER_URL/ws/ssh --user $AUTH_USER --password $AUTH_PASS" \
+        "${ssh_flags[@]}" \
+        "root@$CLEAN_HOST"
+  fi
+}
+
+usage() {
+  echo -e "${C_BOLD}Kaggle Debian Server CLI${C_RESET}"
+  echo -e "Usage: ./bin/server <command> [options]\n"
+  echo "Commands:"
+  echo -e "  ${C_CYAN}up${C_RESET}          Push kernel to Kaggle and wait for server to be live"
+  echo -e "  ${C_CYAN}status${C_RESET}      Check Kaggle kernel status and live server metrics"
+  echo -e "  ${C_CYAN}accounts${C_RESET}    Inspect all 4 Kaggle accounts & GPU quota pool"
+  echo -e "  ${C_CYAN}ask '<prompt>'${C_RESET} Query Gemini 3 Flash Preview & free AI models directly"
+  echo -e "  ${C_CYAN}switch <1-4>${C_RESET} Manually switch active Kaggle account"
+  echo -e "  ${C_CYAN}rotate${C_RESET}      Rotate to the next available account in pool"
+  echo -e "  ${C_CYAN}ssh${C_RESET}         Open interactive SSH root shell"
+  echo -e "  ${C_CYAN}gui <cmd>${C_RESET}   Run GUI app on Kaggle, display natively on Debian 13 XFCE"
+  echo -e "  ${C_CYAN}logs${C_RESET}        View latest Kaggle logs"
+  echo -e "  ${C_CYAN}follow${C_RESET}      Stream live kernel execution logs"
+  echo -e "  ${C_CYAN}web${C_RESET}         Open Web Dashboard ($CLUSTER_URL)"
+  echo -e "  ${C_CYAN}terminal${C_RESET}    Open Web Terminal ($CLUSTER_URL/terminal)"
+  echo -e "  ${C_CYAN}desktop${C_RESET}     Fast VNC desktop on Kaggle: ${C_CYAN}desktop start|stop|status|open${C_RESET}"
+  echo -e "  ${C_CYAN}tunnel${C_RESET}       SSH port forwards: ${C_CYAN}tunnel jupyter|tensorboard|postgres|custom L R${C_RESET}"
+  echo -e "  ${C_CYAN}local${C_RESET}        Show fast local-first architecture (optimistic UI)"
+  echo -e "  ${C_CYAN}save${C_RESET}        Save package & state bundle to persistent cache"
+  echo -e "  ${C_CYAN}push <src> [dst]${C_RESET}  Upload files to /kaggle/working/"
+  echo -e "  ${C_CYAN}pull <src> [dst]${C_RESET}  Download files from Kaggle"
+  echo -e "  ${C_CYAN}stop${C_RESET}        Safely shut down the Kaggle server"
+  echo -e "  ${C_CYAN}bridge [start|stop|status]${C_RESET} Local OpenAI bridge for OpenCode & Cline (free $40/day models)"
+  echo -e "  ${C_CYAN}code${C_RESET}        Launch local Desktop VS Code connected to Kaggle"
+  echo -e "  ${C_CYAN}code-web${C_RESET}    Open Web VS Code in your browser (Blazing Fast, 60 FPS, Zero Lag)"
+  echo -e "  ${C_CYAN}vscode${C_RESET}      Configure VS Code Remote-SSH connection"
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  ask)
+    if [ -z "${1:-}" ]; then
+      die "Usage: ./bin/server ask '<your prompt>' [-m model_name]"
+    fi
+    python3 "$ROOT/bin/ask-ai.py" "$@"
+    ;;
+
+  accounts|pool)
+    python3 "$POOL_HELPER" list
+    ;;
+
+  switch)
+    python3 "$POOL_HELPER" switch "$@"
+    ;;
+
+  rotate)
+    python3 "$POOL_HELPER" rotate "$@"
+    ;;
+
+  up)
+    echo -e "${C_CYAN}>>> Building notebook.ipynb with current configuration...${C_RESET}"
+    python3 "$MAKE_KERNEL" "$ROOT/notebook.ipynb"
+    echo -e "${C_CYAN}>>> Pushing kernel with auto-failover quota protection...${C_RESET}"
+    python3 "$POOL_HELPER" push || die "Kernel push failed"
+    eval "$(python3 "$POOL_HELPER" env 2>/dev/null | grep '^export ')"
+    echo -e "${C_GREEN}>>> Kernel pushed to $KERNEL! Waiting for server to boot at $CLUSTER_URL ...${C_RESET}"
+
+    MAX_TRIES=60
+    LIVE=false
+    for i in $(seq 1 "$MAX_TRIES"); do
+      if curl -s -f -u "$AUTH_USER:$AUTH_PASS" --max-time 3 "$CLUSTER_URL/health" >/dev/null 2>&1; then
+        LIVE=true
+        break
+      fi
+      printf "."
+      sleep 5
+    done
+    echo ""
+
+    if [ "$LIVE" = true ]; then
+      echo -e "${C_GREEN}========================================================================${C_RESET}"
+      echo -e "${C_BOLD}🎉 KAGGLE DEBIAN SERVER IS READY!${C_RESET}"
+      echo -e "Web Dashboard : ${C_CYAN}$CLUSTER_URL${C_RESET}"
+      echo -e "Web Terminal  : ${C_CYAN}$CLUSTER_URL/terminal${C_RESET}"
+      echo -e "SSH Connect   : ${C_YELLOW}./bin/server ssh${C_RESET}"
+      echo -e "GUI Forward   : ${C_YELLOW}./bin/server gui xeyes${C_RESET}"
+      echo -e "${C_GREEN}========================================================================${C_RESET}"
+    else
+      echo -e "${C_YELLOW}Server is still initializing. Check logs with: ./bin/server follow${C_RESET}"
+    fi
+    ;;
+
+  status)
+    echo -e "${C_BOLD}--- Active Kaggle Account ---${C_RESET}"
+    python3 "$POOL_HELPER" active
+    echo -e "\n${C_BOLD}--- Kaggle Kernel State ($KERNEL) ---${C_RESET}"
+    kaggle kernels status "$KERNEL" || true
+    echo -e "\n${C_BOLD}--- Live Server Health ($CLUSTER_URL) ---${C_RESET}"
+    if curl -s -f -u "$AUTH_USER:$AUTH_PASS" --max-time 5 "$CLUSTER_URL/health" | python3 -m json.tool 2>/dev/null; then
+      echo -e "${C_GREEN}Server status: ONLINE & RESPONDING${C_RESET}"
+    else
+      echo -e "${C_RED}Server not reachable at $CLUSTER_URL (may still be booting or stopped).${C_RESET}"
+    fi
+    ;;
+
+  ssh)
+    echo -e "${C_CYAN}>>> Connecting to Kaggle server via WebSocket SSH proxy...${C_RESET}"
+    run_ssh "$@"
+    ;;
+
+  gui|x11)
+    if [ -z "${1:-}" ]; then
+      die "Please provide a GUI command to run. Example: ./bin/server gui xeyes"
+    fi
+    echo -e "${C_CYAN}>>> Launching GUI application '$*' on Kaggle with X11 forwarding to Debian 13 XFCE...${C_RESET}"
+    run_ssh -Y -C -- "$@"
+    ;;
+
+  logs)
+    kaggle kernels logs "$KERNEL" | pretty_logs || true
+    ;;
+
+  follow)
+    echo -e "${C_CYAN}>>> Following live kernel logs (Ctrl-C to detach)...${C_RESET}"
+    kaggle kernels logs -f "$KERNEL" 2>/dev/null | pretty_logs || true
+    ;;
+
+  web)
+    echo -e "${C_CYAN}>>> Opening Web Dashboard in browser...${C_RESET}"
+    xdg-open "$CLUSTER_URL" 2>/dev/null || sensible-browser "$CLUSTER_URL" 2>/dev/null || echo "$CLUSTER_URL"
+    ;;
+
+  terminal)
+    echo -e "${C_CYAN}>>> Opening Web Terminal in browser...${C_RESET}"
+    xdg-open "$CLUSTER_URL/terminal" 2>/dev/null || sensible-browser "$CLUSTER_URL/terminal" 2>/dev/null || echo "$CLUSTER_URL/terminal"
+    ;;
+
+  desktop)
+    subctx="${1:-start}"
+    shift || true
+    VNC_PASS="${VNC_PASS:-kaggle}"
+    VNC_GEOMETRY="${VNC_GEOMETRY:-1920x1080}"
+    VNC_DISPLAY="${VNC_DISPLAY:-:1}"
+    VNC_URL="$CLUSTER_URL/vnc/vnc.html?autoconnect=true&resize=remote&reconnect=true&path=/vnc/websockify"
+
+    case "$subctx" in
+      start|on)
+        echo -e "${C_CYAN}>>> Provisioning fast remote desktop on Kaggle (XFCE + TigerVNC + noVNC)...${C_RESET}"
+        run_ssh "VNC_PASS='$VNC_PASS' VNC_GEOMETRY='$VNC_GEOMETRY' VNC_DISPLAY='$VNC_DISPLAY' bash -s" <<'REMOTE'
+set -u
+NEED_INSTALL=0
+command -v vncserver      >/dev/null 2>&1 || NEED_INSTALL=1
+command -v websockify     >/dev/null 2>&1 || NEED_INSTALL=1
+command -v startxfce4     >/dev/null 2>&1 || NEED_INSTALL=1
+[ -d /usr/share/novnc ]                    || NEED_INSTALL=1
+
+if [ "$NEED_INSTALL" = "1" ]; then
+  echo "[desktop] installing desktop stack (this happens only once)..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends \
+    tigervnc-standalone-server tigervnc-common \
+    novnc websockify \
+    xfce4 xfce4-terminal thunar dbus-x11 \
+    x11-xserver-utils xauth fonts-dejavu-core xterm || true
+fi
+
+# Fallbacks if the distro packages are unavailable
+command -v websockify >/dev/null 2>&1 || python3 -m pip install -q websockify
+NOVNC_WEB=/usr/share/novnc
+if [ ! -d "$NOVNC_WEB" ]; then
+  echo "[desktop] fetching noVNC web client..."
+  mkdir -p /opt/novnc
+  curl -fsSL https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.tar.gz \
+    | tar xz -C /opt && cp -a /opt/noVNC-1.6.0/. /opt/novnc/
+  NOVNC_WEB=/opt/novnc
+fi
+
+mkdir -p "$HOME/.vnc"
+if command -v vncpasswd >/dev/null 2>&1; then
+  printf '%s\n' "$VNC_PASS" | vncpasswd -f > "$HOME/.vnc/passwd"
+elif command -v tigervncpasswd >/dev/null 2>&1; then
+  printf '%s\n' "$VNC_PASS" | tigervncpasswd -f > "$HOME/.vnc/passwd"
+else
+  # Fallback: build the 8-byte VNC password file directly
+  # (DES-ECB of the zero-padded password with the standard VNC key).
+  python3 - "$VNC_PASS" "$HOME/.vnc/passwd" <<'PYPW'
+import sys
+pw = sys.argv[1].encode()[:8].ljust(8, b"\0")
+key = bytes.fromhex("e84ad660c4721ae0")
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    enc = Cipher(algorithms.TripleDES(key * 3), modes.ECB()).encryptor()
+    out = enc.update(pw) + enc.finalize()
+except Exception:
+    import subprocess
+    out = subprocess.run(
+        ["openssl", "enc", "-des-ecb", "-K", "e84ad660c4721ae0", "-nopad", "-nosalt",
+         "-provider", "legacy", "-provider", "default"],
+        input=pw, capture_output=True).stdout
+open(sys.argv[2], "wb").write(out)
+PYPW
+fi
+chmod 600 "$HOME/.vnc/passwd"
+[ "$(stat -c%s "$HOME/.vnc/passwd")" = "8" ] || echo "[desktop] WARNING: VNC password file is $(stat -c%s "$HOME/.vnc/passwd") bytes (expected 8)"
+
+cat > "$HOME/.vnc/xstartup" <<'XSTART'
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+xset -dpms s off 2>/dev/null || true
+if command -v dbus-launch >/dev/null 2>&1; then
+  exec dbus-launch --exit-with-session startxfce4
+else
+  exec startxfce4
+fi
+XSTART
+chmod +x "$HOME/.vnc/xstartup"
+
+# (re)start the virtual desktop + web bridge
+vncserver -kill "$VNC_DISPLAY" >/dev/null 2>&1 || true
+pkill -f "websockify .*127.0.0.1:6081" >/dev/null 2>&1 || true
+sleep 1
+vncserver "$VNC_DISPLAY" -geometry "$VNC_GEOMETRY" -depth 24 \
+  -localhost -SecurityTypes VncAuth -name kaggle-desktop >/tmp/vncserver.log 2>&1
+nohup websockify --web="$NOVNC_WEB" 127.0.0.1:6081 127.0.0.1:5901 \
+  >/tmp/websockify.log 2>&1 &
+sleep 2
+if vncserver -list 2>/dev/null | grep -q "${VNC_DISPLAY#:}"; then
+  echo "[desktop] VNC $VNC_DISPLAY running at $VNC_GEOMETRY"
+else
+  echo "[desktop] WARNING: VNC may not have started, see /tmp/vncserver.log"
+  tail -20 /tmp/vncserver.log || true
+fi
+pgrep -f "websockify .*127.0.0.1:6081" >/dev/null && echo "[desktop] noVNC bridge on 127.0.0.1:6081" || echo "[desktop] WARNING: websockify not running"
+REMOTE
+        echo -e "${C_GREEN}✓ Remote desktop is ready.${C_RESET}"
+        echo -e "  ${C_BOLD}Open:${C_RESET} ${C_CYAN}${VNC_URL}${C_RESET}"
+        echo -e "  ${C_BOLD}VNC password:${C_RESET} ${VNC_PASS}"
+        echo -e "  ${C_DIM}Tip: set VNC_GEOMETRY=1600x900 for a slower link.${C_RESET}"
+        ;;
+
+      stop|off)
+        echo -e "${C_YELLOW}>>> Stopping remote desktop...${C_RESET}"
+        run_ssh 'pkill -f "websockify .*127.0.0.1:6081" 2>/dev/null; vncserver -kill :1 2>/dev/null; echo "[desktop] stopped"'
+        ;;
+
+      status)
+        run_ssh 'echo "--- VNC ---"; vncserver -list 2>/dev/null || echo "not running"; echo "--- websockify ---"; pgrep -af "[w]ebsockify" || echo "not running"'
+        ;;
+
+      open)
+        echo -e "${C_CYAN}>>> Opening Remote Desktop in browser...${C_RESET}"
+        xdg-open "$VNC_URL" 2>/dev/null || sensible-browser "$VNC_URL" 2>/dev/null || echo "$VNC_URL"
+        ;;
+
+      *)
+        die "Usage: ./bin/server desktop [start|stop|status|open]"
+        ;;
+    esac
+    ;;
+
+  save)
+    echo -e "${C_CYAN}>>> Requesting Kaggle server state save to persistent cache bundle...${C_RESET}"
+    curl -s -u "$AUTH_USER:$AUTH_PASS" -X POST "$CLUSTER_URL/api/save" | python3 -m json.tool || true
+    ;;
+
+  stop)
+    echo -e "${C_YELLOW}>>> Requesting safe server shutdown...${C_RESET}"
+    curl -s -u "$AUTH_USER:$AUTH_PASS" -X POST "$CLUSTER_URL/api/stop" | python3 -m json.tool || true
+    ;;
+
+  push)
+    local_src="${1:-}"
+    remote_dst="${2:-/kaggle/working/}"
+    if [ -z "$local_src" ]; then
+      die "Usage: ./bin/server push <local_path> [remote_path]"
+    fi
+    echo -e "${C_CYAN}>>> Uploading '$local_src' to '$remote_dst' on Kaggle...${C_RESET}"
+    rsync -avz --progress -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand=\"python3 $PROXY_SCRIPT --url $CLUSTER_URL/ws/ssh --user $AUTH_USER --password $AUTH_PASS\"" \
+      "$local_src" "root@$CLEAN_HOST:$remote_dst"
+    ;;
+
+  pull)
+    remote_src="${1:-}"
+    local_dst="${2:-./}"
+    if [ -z "$remote_src" ]; then
+      die "Usage: ./bin/server pull <remote_path> [local_path]"
+    fi
+    echo -e "${C_CYAN}>>> Downloading '$remote_src' from Kaggle to '$local_dst'...${C_RESET}"
+    rsync -avz --progress -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand=\"python3 $PROXY_SCRIPT --url $CLUSTER_URL/ws/ssh --user $AUTH_USER --password $AUTH_PASS\"" \
+      "root@$CLEAN_HOST:$remote_src" "$local_dst"
+    ;;
+
+  vscode)
+    SSH_CONFIG_BLOCK="Host kaggle-server
+    HostName your-subdomain.example.com
+    User root
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+    ProxyCommand python3 $PROXY_SCRIPT --url $CLUSTER_URL/ws/ssh --user $AUTH_USER --password $AUTH_PASS
+    ForwardX11 no
+    ForwardX11Trusted no
+    Compression yes
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 2h
+    TCPKeepAlive yes
+    IPQoS throughput
+    ServerAliveInterval 15
+    ServerAliveCountMax 5"
+
+    echo -e "${C_BOLD}=== VS Code Remote-SSH Configuration ===${C_RESET}\n"
+    echo -e "Add this block to your ${C_CYAN}~/.ssh/config${C_RESET} file:\n"
+    echo "$SSH_CONFIG_BLOCK"
+    echo ""
+    read -p "Would you like to automatically append this to ~/.ssh/config? (y/N): " -r choice
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+      mkdir -p ~/.ssh
+      if grep -q "Host kaggle-server" ~/.ssh/config 2>/dev/null; then
+        echo -e "${C_YELLOW}Note: 'Host kaggle-server' already exists in ~/.ssh/config. Skipping append.${C_RESET}"
+      else
+        echo "" >> ~/.ssh/config
+        echo "$SSH_CONFIG_BLOCK" >> ~/.ssh/config
+        echo -e "${C_GREEN}Successfully appended to ~/.ssh/config!${C_RESET}"
+        echo -e "You can now connect in VS Code by selecting 'Connect to Host...' -> 'kaggle-server'."
+      fi
+    fi
+    ;;
+
+  code)
+    echo -e "${C_CYAN}>>> Launching Desktop VS Code connected directly to Kaggle (/kaggle/working)...${C_RESET}"
+    code --remote "ssh-remote+kaggle-server" /kaggle/working >/dev/null 2>&1 &
+    echo -e "${C_GREEN}VS Code is opening connected to Kaggle!${C_RESET}"
+    ;;
+
+  code-web)
+    echo -e "${C_CYAN}>>> Starting Web VS Code connection...${C_RESET}"
+    # Ensure port 8085 is forwarded to localhost
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+        -O forward -L 8085:127.0.0.1:8085 kaggle-server 2>/dev/null || \
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+        -f -N -L 8085:127.0.0.1:8085 kaggle-server 2>/dev/null || true
+
+    LOCAL_CODE_URL="http://127.0.0.1:8085/?folder=/kaggle/working"
+    echo -e "${C_GREEN}✓ Web VS Code is ready!${C_RESET}"
+    echo -e "${C_BOLD}Opening: ${C_CYAN}${LOCAL_CODE_URL}${C_RESET}"
+    if command -v xdg-open >/dev/null 2>&1; then
+      xdg-open "$LOCAL_CODE_URL" >/dev/null 2>&1 &
+    fi
+    ;;
+
+  local)
+    echo -e "${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_BOLD}  FAST LOCAL-FIRST ARCHITECTURE (Optimistic UI)${C_RESET}"
+    echo -e "${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo
+    echo -e "${C_CYAN}┌─ YOUR DEBIAN 13 (zero-latency UI) ────────────────────────┐${C_RESET}"
+    echo -e "${C_CYAN}│${C_RESET}  ${C_BOLD}Editor:${C_RESET}      VS Code (native)  →  Remote-SSH → kaggle-server"
+    echo -e "${C_CYAN}│${C_RESET}  ${C_BOLD}Notebooks:${C_RESET}   Browser (native) →  ${CLUSTER_URL}  or  ./bin/server tunnel jupyter"
+    echo -e "${C_CYAN}│${C_RESET}  ${C_BOLD}Terminal:${C_RESET}    ./bin/server ssh   or  ./bin/server terminal"
+    echo -e "${C_CYAN}│${C_RESET}  ${C_BOLD}TensorBoard:${C_RESET} ./bin/server tunnel tensorboard  →  localhost:6006"
+    echo -e "${C_CYAN}│${C_RESET}  ${C_BOLD}Database:${C_RESET}    ./bin/server tunnel postgres     →  localhost:5432"
+    echo -e "${C_CYAN}│${C_RESET}  ${C_BOLD}Custom app:${C_RESET}  ./bin/server tunnel custom 3000 3000  →  localhost:3000"
+    echo -e "${C_CYAN}└────────────────────────────────────────────────────────────┘${C_RESET}"
+    echo
+    echo -e "${C_CYAN}┌─ KAGGLE (T4 GPU, heavy compute only) ─────────────────────┐${C_RESET}"
+    echo -e "${C_CYAN}│${C_RESET}  VS Code Server      (port 8085)   ← tunnel start"
+    echo -e "${C_CYAN}│${C_RESET}  JupyterLab          (port 8888)   ← tunnel jupyter"
+    echo -e "${C_CYAN}│${C_RESET}  TensorBoard         (port 6006)   ← tunnel tensorboard"
+    echo -e "${C_CYAN}│${C_RESET}  Postgres/Redis      (port 5432)   ← tunnel postgres"
+    echo -e "${C_CYAN}│${C_RESET}  Your ML training    (GPU)         ← runs in terminal/ssh"
+    echo -e "${C_CYAN}└────────────────────────────────────────────────────────────┘${C_RESET}"
+    echo
+    echo -e "${C_BOLD}QUICK START (run once):${C_RESET}"
+    echo -e "  1) ${C_CYAN}./bin/server vscode${C_RESET}      # adds SSH config to ~/.ssh/config"
+    echo -e "  2) Open VS Code → ${C_CYAN}Ctrl+Shift+P${C_RESET} → ${C_CYAN}Remote-SSH: Connect to Host...${C_RESET} → ${C_CYAN}kaggle-server${C_RESET}"
+    echo -e "  3) ${C_CYAN}./bin/server tunnel start${C_RESET}  # forwards VS Code server port"
+    echo -e "  4) ${C_CYAN}./bin/server tunnel jupyter${C_RESET} # JupyterLab at localhost:8888"
+    echo
+    echo -e "${C_BOLD}WHY THIS IS FAST:${C_RESET}"
+    echo -e "  • UI renders locally (60 FPS, no lag)"
+    echo -e "  • Only keystrokes/file-saves go over the tunnel (~200 ms RTT)"
+    echo -e "  • GPU training, pip installs, big data stay on Kaggle"
+    echo -e "  • Like \"optimistic UI\" — you type, it responds instantly"
+    echo
+    echo -e "${C_DIM}The VNC desktop (./bin/server desktop) is the SLOW path — avoid for daily work.${C_RESET}"
+    ;;
+
+  tunnel)
+    subctx="${1:-list}"
+    shift || true
+    case "$subctx" in
+      list|ls)
+        echo -e "${C_CYAN}Active SSH tunnels for kaggle-server:${C_RESET}"
+        ssh -O check kaggle-server 2>&1 | grep -E '^Local|^Remote' || \
+        (ps aux | grep -E "ssh.*-L.*kaggle-server" | grep -v grep | awk '{print "  Local " $NF}') || \
+        echo "  (none - run 'tunnel start' first)"
+        ;;
+
+      start|on)
+        local_local="${1:-8085}"
+        local_remote="${2:-8085}"
+        echo -e "${C_CYAN}>>> Starting tunnel: localhost:$local_local -> kaggle:127.0.0.1:$local_remote${C_RESET}"
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            -f -N -L "$local_local:127.0.0.1:$local_remote" kaggle-server
+        sleep 1
+        if ssh -O check kaggle-server 2>&1 | grep -q "Local.*$local_local"; then
+          echo -e "${C_GREEN}✓ Tunnel active${C_RESET}  http://localhost:$local_local"
+        else
+          echo -e "${C_RED}✗ Failed${C_RESET}"
+        fi
+        ;;
+
+      stop|off)
+        local_local="${1:-8085}"
+        echo -e "${C_YELLOW}>>> Stopping tunnel localhost:$local_local${C_RESET}"
+        # Try both common remote ports
+        ssh -O cancel -L "$local_local:127.0.0.1:8085" kaggle-server 2>/dev/null || true
+        ssh -O cancel -L "$local_local:127.0.0.1:8888" kaggle-server 2>/dev/null || true
+        ssh -O cancel -L "$local_local:127.0.0.1:6006" kaggle-server 2>/dev/null || true
+        ssh -O cancel -L "$local_local:127.0.0.1:5432" kaggle-server 2>/dev/null || true
+        pkill -f "ssh.*-L $local_local:.*kaggle-server" 2>/dev/null || true
+        echo -e "${C_GREEN}✓ Stopped${C_RESET}"
+        ;;
+
+      jupyter|lab)
+        # JupyterLab on Kaggle port 8888 -> local 8888
+        echo -e "${C_CYAN}>>> Starting JupyterLab on Kaggle and tunneling (8888 -> localhost:8888)${C_RESET}"
+        run_ssh 'bash -s' <<'REMOTE'
+set -e
+if ! pgrep -f "jupyter-lab" >/dev/null 2>&1; then
+  echo "[jupyter] starting JupyterLab..."
+  mkdir -p /kaggle/working/.jupyter
+  cat > /kaggle/working/.jupyter/jupyter_notebook_config.py <<'JCFG'
+c.ServerApp.ip = '127.0.0.1'
+c.ServerApp.port = 8888
+c.ServerApp.open_browser = False
+c.ServerApp.allow_remote_access = False
+c.ServerApp.token = ''
+c.ServerApp.password = ''
+c.ServerApp.allow_root = True
+c.ServerApp.root_dir = '/kaggle/working'
+c.ServerApp.allow_origin = '*'
+c.ServerApp.disable_check_xsrf = True
+JCFG
+  nohup python3 -m jupyter lab >/kaggle/working/jupyter.log 2>&1 &
+  sleep 3
+else
+  echo "[jupyter] already running"
+fi
+pgrep -f "jupyter-lab" >/dev/null && echo "[jupyter] OK" || echo "[jupyter] FAILED"
+REMOTE
+        sleep 1
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            -f -N -L 8888:127.0.0.1:8888 kaggle-server
+        sleep 1
+        echo -e "${C_GREEN}✓ JupyterLab:${C_RESET} http://localhost:8888  (no token needed)"
+        ;;
+
+      tensorboard|tb)
+        local port="${1:-6006}"
+        echo -e "${C_CYAN}>>> Starting TensorBoard on Kaggle and tunneling ($port -> localhost:$port)${C_RESET}"
+        run_ssh "tensorboard --logdir=/kaggle/working --host=127.0.0.1 --port=$port &" || true
+        sleep 2
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            -f -N -L "$port:127.0.0.1:$port" kaggle-server
+        sleep 1
+        echo -e "${C_GREEN}✓ TensorBoard:${C_RESET} http://localhost:$port"
+        ;;
+
+      postgres|pg)
+        local port="${1:-5432}"
+        echo -e "${C_CYAN}>>> Starting PostgreSQL on Kaggle and tunneling ($port -> localhost:$port)${C_RESET}"
+        run_ssh 'bash -s' <<'REMOTE'
+set -e
+if ! pgrep -x "postgres" >/dev/null 2>&1; then
+  echo "[postgres] starting PostgreSQL..."
+  if [ ! -d "/kaggle/working/pgdata" ]; then
+    mkdir -p /kaggle/working/pgdata
+    initdb -D /kaggle/working/pgdata --auth=trust >/dev/null 2>&1
+    echo "host all all 0.0.0.0/0 trust" >> /kaggle/working/pgdata/pg_hba.conf
+    echo "listen_addresses = '127.0.0.1'" >> /kaggle/working/pgdata/postgresql.conf
+  fi
+  pg_ctl -D /kaggle/working/pgdata -l /kaggle/working/postgres.log start >/dev/null 2>&1
+  sleep 2
+  createdb -h 127.0.0.1 -U postgres kaggle_db 2>/dev/null || true
+else
+  echo "[postgres] already running"
+fi
+pgrep -x "postgres" >/dev/null && echo "[postgres] OK" || echo "[postgres] FAILED"
+REMOTE
+        sleep 1
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            -f -N -L "$port:127.0.0.1:$port" kaggle-server
+        sleep 1
+        echo -e "${C_GREEN}✓ Postgres:${C_RESET} postgresql://postgres@localhost:$port/kaggle_db"
+        ;;
+
+      custom)
+        local local_port="${1:-}"
+        local remote_port="${2:-}"
+        local remote_host="${3:-127.0.0.1}"
+        if [ -z "$local_port" ] || [ -z "$remote_port" ]; then
+          die "Usage: ./bin/server tunnel custom <local_port> <remote_port> [remote_host]"
+        fi
+        echo -e "${C_CYAN}>>> Tunneling localhost:$local_port -> kaggle:$remote_host:$remote_port${C_RESET}"
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            -f -N -L "$local_port:$remote_host:$remote_port" kaggle-server
+        sleep 1
+        echo -e "${C_GREEN}✓ Custom tunnel active${C_RESET}"
+        ;;
+
+      killall)
+        echo -e "${C_YELLOW}>>> Killing all tunnels for kaggle-server${C_RESET}"
+        ssh -O exit kaggle-server 2>/dev/null || true
+        pkill -f "ssh.*kaggle-server" 2>/dev/null || true
+        echo -e "${C_GREEN}✓ All tunnels stopped${C_RESET}"
+        ;;
+
+      *)
+        echo -e "${C_BOLD}tunnel${C_RESET} - Manage SSH port forwards to Kaggle (local UI, remote compute)"
+        echo
+        echo "Usage: ./bin/server tunnel <command>"
+        echo
+        echo "Commands:"
+        echo -e "  ${C_CYAN}list${C_RESET}           Show active tunnels"
+        echo -e "  ${C_CYAN}start [local] [remote]${C_RESET}  Forward local:local -> kaggle:remote (default 8085:8085)"
+        echo -e "  ${C_CYAN}stop [local]${C_RESET}         Stop a tunnel (default 8085)"
+        echo -e "  ${C_CYAN}jupyter${C_RESET}          Tunnel JupyterLab (8888)"
+        echo -e "  ${C_CYAN}tensorboard${C_RESET}      Tunnel TensorBoard (6006)"
+        echo -e "  ${C_CYAN}postgres${C_RESET}         Tunnel Postgres (5432)"
+        echo -e "  ${C_CYAN}custom L R [H]${C_RESET}     Custom tunnel localhost:L -> kaggle:H:R"
+        echo -e "  ${C_CYAN}killall${C_RESET}          Stop all tunnels"
+        echo
+        echo "Examples:"
+        echo "  ./bin/server tunnel start           # VS Code server"
+        echo "  ./bin/server tunnel jupyter         # JupyterLab at localhost:8888"
+        echo "  ./bin/server tunnel custom 3000 3000  # Local React dev server"
+        ;;
+    esac
+    ;;
+
+  bridge)
+    subcmd="${1:-status}"
+    shift || true
+    BRIDGE_SCRIPT="$ROOT/bin/model-bridge.py"
+    PID_FILE="$ROOT/.model_bridge.pid"
+    case "$subcmd" in
+      start)
+        if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+          echo -e "${C_GREEN}Kaggle AI Model Bridge is already running (PID: $(cat "$PID_FILE")) at http://127.0.0.1:8001/v1${C_RESET}"
+        else
+          echo -e "${C_CYAN}>>> Starting Kaggle AI Model Bridge daemon on http://127.0.0.1:8001/v1...${C_RESET}"
+          nohup python3 "$BRIDGE_SCRIPT" >/dev/null 2>&1 &
+          echo $! > "$PID_FILE"
+          local ready=0
+          for i in {1..8}; do
+            if curl -s --max-time 2 http://127.0.0.1:8001/v1/models >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ $ready -eq 1 ]]; then
+            echo -e "${C_GREEN}✓ Bridge started successfully (PID: $(cat "$PID_FILE"))!${C_RESET}"
+            echo -e "OpenCode and Cline can now query http://127.0.0.1:8001/v1"
+          else
+            echo -e "${C_RED}Failed to start bridge. Check logs or test directly: python3 $BRIDGE_SCRIPT${C_RESET}"
+          fi
+        fi
+        ;;
+      stop)
+        if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+          kill "$(cat "$PID_FILE")" 2>/dev/null || true
+          rm -f "$PID_FILE"
+          echo -e "${C_YELLOW}Bridge daemon stopped.${C_RESET}"
+        else
+          pkill -f "bin/model-bridge.py" 2>/dev/null || true
+          rm -f "$PID_FILE"
+          echo -e "${C_YELLOW}Bridge stopped.${C_RESET}"
+        fi
+        ;;
+      status)
+        echo -e "${C_BOLD}=== Kaggle AI Model Bridge Status ===${C_RESET}"
+        if curl -s --max-time 6 http://127.0.0.1:8001/v1/models >/dev/null 2>&1; then
+          echo -e "Status:   ${C_GREEN}ONLINE & LISTENING (http://127.0.0.1:8001/v1)${C_RESET}"
+          echo -e "Models:   ${C_CYAN}$(curl -s http://127.0.0.1:8001/v1/models | python3 -c "import sys, json; data=json.load(sys.stdin); print(', '.join(m['id'] for m in data['data'] if m.get('owned_by')=='kaggle-alias'))")${C_RESET}\n"
+          echo -e "${C_BOLD}--- Daily Serverless Quota Pool (Auto-Failover Enabled) ---${C_RESET}"
+          curl -s http://127.0.0.1:8001/v1/pool | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+active_slot = data.get('active_slot', 1)
+verified_count = sum(1 for a in data.get('pool', []) if a.get('verified'))
+pool_daily = verified_count * 10.0
+print(f'Active Daily Allowance: \${pool_daily:.2f} / day (\${pool_daily * 30:.2f}/month) across {verified_count} verified accounts')
+print(f'Current Active Provider: Slot {active_slot}\n')
+for acc in data.get('pool', []):
+    slot = acc['slot']
+    user = acc['username']
+    status = acc['status']
+    is_act = ' [ACTIVE]' if slot == active_slot else ''
+    print(f'  Slot {slot}: {user:<15} │ Status: {status}{is_act}')
+"
+        else
+          echo -e "Status:   ${C_RED}OFFLINE${C_RESET}"
+          echo -e "Run './bin/server bridge start' to start the bridge daemon."
+        fi
+        ;;
+      *)
+        echo -e "Usage: ./bin/server bridge [start|stop|status]"
+        ;;
+    esac
+    ;;
+
+  *)
+    usage
+    ;;
+esac

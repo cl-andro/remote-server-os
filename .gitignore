@@ -1,0 +1,60 @@
+# Environment secrets - NEVER COMMIT
+.env
+.env.local
+.env.*.local
+
+# Generated notebook contains embedded secrets from .env
+notebook.ipynb
+
+# Model proxy cache contains tokens
+.model_proxy_cache.json
+.model_proxy_pool_cache.json
+
+# Account cache
+.account_cache.json
+.active_account
+
+# Kernel metadata (contains kernel ID, not secret but regenerated)
+kernel-metadata.json
+
+# Local config directories
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+/tmp/
+*.pid
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
